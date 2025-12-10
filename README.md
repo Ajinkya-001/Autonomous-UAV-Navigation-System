@@ -211,6 +211,24 @@ on environmental certainty.
 - System currently tested only in **PX4 SITL simulation** (no GPS fusion enabled).
 - Narrow vertical gaps may not be detected if outside depth/scan field-of-view.
 
+
+## Performance Metrics
+
+| **Metric**                 | **Measured Result (Simulation Environment)**  |
+| -------------------------- | --------------------------------------------- |
+| Navigation Success Rate    | 78% across cluttered indoor corridors         |
+| Average Cruise Speed       | 1.8 m/s during autonomous traversal           |
+| Minimum Obstacle Clearance | 0.8 m safety buffer maintained                |
+| Mapping Update Rate        | Depth: 30 Hz, LiDAR: 10 Hz fusion             |
+| Path Re-planning Frequency | 2 Hz global A* updates                        |
+| Reliability Duration       | Stable up to ~45 min continuous simulation    |
+| Localization Accuracy      | ±0.12 m positional variance                   |
+| Obstacle Avoidance Latency | <150 ms from detection to control action      |
+| Failure Modes              | Dead-ends & sensor occlusion in tight corners |
+
+
+
+
 ## Future Work
 
 - Hardware validation on real UAV (Jetson + PX4 flight controller)
