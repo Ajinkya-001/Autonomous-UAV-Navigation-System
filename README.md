@@ -74,7 +74,7 @@ Below is the real signal wiring used in this navigation stack:
 | Node Name            | Purpose                                                   | Key Inputs                                                  | Key Outputs                  |
 | -------------------- | --------------------------------------------------------- | ----------------------------------------------------------- | ---------------------------- |
 | `drone.launch.py`    | Orchestrates the full UAV autonomy stack                  | Launch parameters, PX4 interface, sensor drivers            | All core ROS 2 nodes running |
-| `mapping_node.py`    | Builds a real-time 3D occupancy grid of the environment   | `/scan`, `/depth_camera`, `/fmu/out/vehicle_local_position` | `/map`, 3D MarkerArray       |
+| `mapping_node.py`    | Builds a real-time 2.5D occupancy grid of the environment   | `/scan`, `/depth_camera`, `/fmu/out/vehicle_local_position` | `/map`, 3D MarkerArray       |
 | `path_planner.py`    | Performs A* global path generation and dynamic replanning | `/map`                                                      | `/global_path`               |
 | `depth_avoidance.py` | Short-range sensor fusion and collision avoidance         | `/scan`, `/depth_camera`                                    | Safe proximity distance data |
 
