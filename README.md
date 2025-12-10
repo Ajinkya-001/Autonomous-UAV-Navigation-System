@@ -44,7 +44,9 @@ Autonomous UAV navigation system featuring real-time 3D occupancy-grid mapping, 
 
 ## Directory Structure
 
-<img width="610" height="852" alt="Screenshot from 2025-12-10 17-17-23" src="https://github.com/user-attachments/assets/b7a45027-76ce-4bb7-832e-dc78bbceacd6" />
+<img width="643" height="665" alt="image" src="https://github.com/user-attachments/assets/4d86b859-fdb1-45d8-9cb2-044e210b6536" />
+
+
 
 ## Architecture
 ### Functional Overview
