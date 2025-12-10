@@ -1,8 +1,4 @@
 #!/usr/bin/env python3
-"""
-360° Holonomic City Navigator + A* Integration
-v5.5: Smooth A* Following | Correct Path Viz | Real Yaw | Wall-Safety | No Missing Methods
-"""
 
 import rclpy
 from rclpy.node import Node
