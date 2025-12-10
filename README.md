@@ -14,6 +14,11 @@ Autonomous UAV navigation system featuring real-time 3D occupancy-grid mapping, 
 | **Flight Control**            | PX4 Offboard position setpoints applied through ROS 2 middleware for stable navigation.                                             |
 | **Visualization**             | 3D voxel map + global path + UAV pose in RViz for interpretability of autonomy behavior.                                            |
 
+
+## Directory Structure
+
+<img width="610" height="852" alt="Screenshot from 2025-12-10 17-17-23" src="https://github.com/user-attachments/assets/b7a45027-76ce-4bb7-832e-dc78bbceacd6" />
+
 ## Architecture
 ### Functional Overview
 
