@@ -28,15 +28,10 @@ Autonomous UAV navigation system featuring real-time 3D occupancy-grid mapping, 
 
 This project is organized into clear perception, planning and control modules. Each node runs independently and communicates over ROS topics for robust modularity.
 
-| Node                      | Purpose                                                                    | Key Inputs                                                  | Key Outputs                                  |
-| ------------------------- | -------------------------------------------------------------------------- | ----------------------------------------------------------- | -------------------------------------------- |
-| `mapping_node.py`         | Builds a live 3D voxel occupancy grid using LiDAR/Depth rays and UAV pose  | `/scan`, `/depth_camera`, `/fmu/out/vehicle_local_position` | `/map` (OccupancyGrid), 3D voxel MarkerArray |
-| `path_planner.py`         | A*-based global route generation & dynamic replanning based on updated map | `/map`                                                      | `/global_path` (nav_msgs/Path)               |
-| `autonomous_navigator.py` | Global path following with lateral corrections & corridor centering        | `/global_path`, fused safety distances                      | `/trajectory_setpoint` to PX4                |
-| `depth_avoidance.py`      | Fuses short-range LiDAR + Depth sensing & triggers collision overrides     | `/scan`, `/depth_camera`                                    | Fused left/right/front distances for safety  |
-| `offboard_control.py`     | Sends PX4 Offboard commands (arming, takeoff, set-mode, setpoints)         | Internal                                                    | Vehicle commands                             |
-| `bridge_node.py`          | Coordinate frame conversion for PX4 NED ↔ ROS ENU                          | `/vehicle_local_position`                                   | TF: `map → base_link`                        |
-| `sensor_test.py`          | Utility for visualizing sensor data                                        | `/scan`, `/depth_camera`                                    | Rviz debug views                             |
+
+
+
+
 
 
 Nodes are launched together via:
@@ -46,14 +41,14 @@ ros2 launch autonomous_drone drone.launch.py
 
 ## ROS Data Flow
 Below is the real signal wiring used in this navigation stack:
-| Publisher    | Topic                             | Subscriber             | Role                           |
-| ------------ | --------------------------------- | ---------------------- | ------------------------------ |
-| Depth camera | `/depth_camera`                   | Mapping, Sensor Fusion | near-range depth vision        |
-| LiDAR        | `/scan`                           | Mapping, Sensor Fusion | 360° obstacle geometry         |
-| PX4          | `/fmu/out/vehicle_local_position` | Mapping, Navigator     | UAV pose for mapping & control |
-| Mapping      | `/map`                            | A* Planner             | environmental occupancy        |
-| A* Planner   | `/global_path`                    | Navigator              | waypoint tracking              |
-| Navigator    | `/trajectory_setpoint`            | PX4 Flight Controller  | direct UAV command             |
+
+| Node Name            | Purpose                                                   | Key Inputs                                                  | Key Outputs                  |
+| -------------------- | --------------------------------------------------------- | ----------------------------------------------------------- | ---------------------------- |
+| `drone.launch.py`    | Orchestrates the full UAV autonomy stack                  | Launch parameters, PX4 interface, sensor drivers            | All core ROS 2 nodes running |
+| `mapping_node.py`    | Builds a real-time 3D occupancy grid of the environment   | `/scan`, `/depth_camera`, `/fmu/out/vehicle_local_position` | `/map`, 3D MarkerArray       |
+| `path_planner.py`    | Performs A* global path generation and dynamic replanning | `/map`                                                      | `/global_path`               |
+| `depth_avoidance.py` | Short-range sensor fusion and collision avoidance         | `/scan`, `/depth_camera`                                    | Safe proximity distance data |
+
 
 ### Data update rates:
 /depth_camera ~30 Hz
