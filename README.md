@@ -39,7 +39,7 @@ Autonomous UAV navigation system featuring real-time 3D occupancy-grid mapping, 
 | **Global Planning**           | Continuous A* replanning with safety-inflated costmap and smoothed trajectory publishing.                                           |
 | **Local Navigation & Safety** | Reactive velocity commands, corridor-centering and collision overrides based on depth and LiDAR fusion.                             |
 | **Flight Control**            | PX4 Offboard position setpoints applied through ROS 2 middleware for stable navigation.                                             |
-| **Visualization**             | 3D voxel map + global path + UAV pose in RViz for interpretability of autonomy behavior.                                            |
+| **Visualization**             |  voxel map + global path + UAV pose in RViz for interpretability of autonomy behavior.                                            |
 
 
 ## Directory Structure
