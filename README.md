@@ -191,7 +191,7 @@ on environmental certainty.
 
 
 <p align="center">
-  <img src="https://github.com/user-attachments/assets/f8286292-b41c-43ad-b79c-c7caccfe74ee" width="90%">
+  <img src="https://github.com/user-attachments/assets/7ddb291a-6e06-4182-ab47-a1ee97fb05b5" width="90%">
 </p>
 <p align="center"><i>Autonomous transition from reactive local avoidance to global A* navigation as mapping improves.</i></p>
 
