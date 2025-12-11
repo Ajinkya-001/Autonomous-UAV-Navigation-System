@@ -73,6 +73,21 @@ Below is the real signal wiring used in this navigation stack:
 | `depth_avoidance.py` | Short-range sensor fusion and collision avoidance         | `/scan`, `/depth_camera`                                    | Safe proximity distance data |
 
 
+
+<p align="center">
+  <img src="https://github.com/user-attachments/assets/b9739df3-2ec4-45ec-bd63-3482856524fc" controls width="90%"></video>
+</p>
+<p align="center"><i>Real-time mapping and A*-driven navigation to user-selected waypoints in dense corridors.</i></p>
+
+<br><br>
+
+
+<p align="center">
+  <img src="https://github.com/user-attachments/assets/7ddb291a-6e06-4182-ab47-a1ee97fb05b5" width="90%">
+</p>
+<p align="center"><i>Autonomous transition from reactive local avoidance to global A* navigation as mapping improves.</i></p>
+
+
 ### Data update rates:
 
 - /depth_camera ~30 Hz
@@ -165,22 +180,6 @@ ros2 launch autonomous_drone drone.launch.py
 
 The system continuously switches between global planning and local safety behaviors depending
 on environmental certainty.
-
-
-
-<p align="center">
-  <img src="https://github.com/user-attachments/assets/b9739df3-2ec4-45ec-bd63-3482856524fc" controls width="90%"></video>
-</p>
-<p align="center"><i>Real-time mapping and A*-driven navigation to user-selected waypoints in dense corridors.</i></p>
-
-<br><br>
-
-
-<p align="center">
-  <img src="https://github.com/user-attachments/assets/7ddb291a-6e06-4182-ab47-a1ee97fb05b5" width="90%">
-</p>
-<p align="center"><i>Autonomous transition from reactive local avoidance to global A* navigation as mapping improves.</i></p>
-
 
 
 
