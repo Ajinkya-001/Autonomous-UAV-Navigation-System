@@ -31,12 +31,11 @@ class FlightPhase(IntEnum):
 
 
 class NavigationMode(IntEnum):
-    PATH_FOLLOWING = 0  # Following A* waypoints
-    EXPLORATION = 1      # Direct navigation when no path
+    PATH_FOLLOWING = 0
+    EXPLORATION = 1
 
 
 def point_to_segment_distance(px, py, x1, y1, x2, y2):
-    """Distance from point to line segment."""
     A = px - x1
     B = py - y1
     C = x2 - x1
@@ -91,10 +90,14 @@ class SmartObstacleNavigator(Node):
         self.declare_parameters("", [("flight_altitude", 5.0)])
         self.flight_altitude = float(self.get_parameter("flight_altitude").value)
 
+        # Drone-specific physical constraints (x500 model)
+        self.MIN_SAFE_CLEARANCE = 0.7  # meters - based on 0.5m rotor span + safety
+        self.CORRIDOR_THRESHOLD = 3.0   # consider corridor if both sides < 3m
+
         self.waypoints = []
         self.wp_index = 0
         self.manual_goal = False
-        self.goal_pose = None  # Store goal for exploration mode
+        self.goal_pose = None
         self.nav_mode = NavigationMode.PATH_FOLLOWING
         self.last_path_hash = None
 
@@ -121,16 +124,22 @@ class SmartObstacleNavigator(Node):
         self.filtered_center_err = 0.0
         self.prev_yaw = 0.0
         
-        # Smooth velocity control
         self.current_forward_vel = 0.0
         self.current_side_vel = 0.0
         
-        # Stuck detection
         self.stuck_counter = 0
         self.position_history = deque(maxlen=50)
-        
-        # Performance tracking
         self.last_waypoint_time = 0.0
+        
+        # Enhanced features
+        self.consecutive_failures = 0
+        self.last_progress_check = 0.0
+        self.last_progress_distance = 0.0
+        self.yaw_history = deque(maxlen=20)
+        self.lateral_history = deque(maxlen=20)
+        
+        # Wide space handling
+        self.last_significant_clearance = 0.0
 
         qos_cmd = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
@@ -161,44 +170,30 @@ class SmartObstacleNavigator(Node):
         self.viz_path_pub = self.create_publisher(Path, "/planned_path", qos_viz)
 
         self.create_subscription(
-            VehicleLocalPosition,
-            "/fmu/out/vehicle_local_position",
-            self.pos_cb,
-            qos_cmd,
+            VehicleLocalPosition, "/fmu/out/vehicle_local_position", self.pos_cb, qos_cmd
         )
         self.create_subscription(
             VehicleStatus, "/fmu/out/vehicle_status", self.status_cb, qos_cmd
         )
         self.create_subscription(Image, "/depth_camera", self.depth_cb, qos_sensor)
         self.create_subscription(LaserScan, "/scan", self.lidar_cb, qos_sensor)
-
         self.create_subscription(Path, "/global_path", self.path_cb, 10)
         self.create_subscription(PoseStamped, "/goal_pose", self.goal_cb, 10)
 
         self.bridge = CvBridge()
         self.timer = self.create_timer(0.1, self.control_loop)
 
-        self.get_logger().info("Navigator v8.0 Ready - Dual Mode (Path + Exploration)")
-
-    # ---------- PATH UTILS ----------
-
-    def get_path_error(self):
-        if len(self.waypoints) < 2 or self.wp_index >= len(self.waypoints) - 1:
-            return 0.0
-        px, py = self.current_x, self.current_y
-        best = float("inf")
-        start = max(0, self.wp_index)
-        for i in range(start, len(self.waypoints) - 1):
-            x1, y1 = self.waypoints[i]
-            x2, y2 = self.waypoints[i + 1]
-            d = point_to_segment_distance(px, py, x1, y1, x2, y2)
-            if d < best:
-                best = d
-        return best
+        self.get_logger().info(f"Navigator v10.0 Ready - x500 Optimized (clearance: {self.MIN_SAFE_CLEARANCE}m)")
 
     def get_lookahead_target(self, lookahead_dist=2.5):
         if self.wp_index >= len(self.waypoints):
             return None
+        
+        min_clearance = min(self.fused_left, self.fused_right, self.fused_front)
+        if min_clearance < 2.0:
+            lookahead_dist = 1.5
+        elif self.current_forward_vel > 7.0:
+            lookahead_dist = 3.5
         
         accumulated_dist = 0.0
         px, py = self.current_x, self.current_y
@@ -218,6 +213,17 @@ class SmartObstacleNavigator(Node):
             px, py = wx, wy
         
         return self.waypoints[-1]
+
+    def is_oscillating(self):
+        if len(self.lateral_history) < 15:
+            return False
+        
+        direction_changes = 0
+        for i in range(1, len(self.lateral_history)):
+            if self.lateral_history[i] * self.lateral_history[i-1] < 0:
+                direction_changes += 1
+        
+        return direction_changes > 8
 
     def is_stuck(self):
         if len(self.position_history) < 30:
@@ -254,7 +260,6 @@ class SmartObstacleNavigator(Node):
     def path_cb(self, msg: Path):
         new_wps = [(p.pose.position.x, p.pose.position.y) for p in msg.poses]
         if not new_wps:
-            # Empty path from A* - switch to exploration mode
             if self.goal_pose and self.phase == FlightPhase.NAVIGATE:
                 goal_dist = math.hypot(
                     self.goal_pose[0] - self.current_x,
@@ -262,7 +267,7 @@ class SmartObstacleNavigator(Node):
                 )
                 if goal_dist > 1.0:
                     self.nav_mode = NavigationMode.EXPLORATION
-                    self.get_logger().warn("No global path - switching to EXPLORATION mode")
+                    self.get_logger().warn("No path - EXPLORATION mode")
             return
         
         path_hash = hash(tuple(new_wps))
@@ -270,31 +275,21 @@ class SmartObstacleNavigator(Node):
             return
         self.last_path_hash = path_hash
         
-        # Check if A* path is stupidly inefficient (exploring is faster)
         if self.goal_pose:
-            # Calculate path length
-            path_length = 0.0
-            for i in range(len(new_wps) - 1):
-                path_length += math.hypot(
-                    new_wps[i+1][0] - new_wps[i][0],
-                    new_wps[i+1][1] - new_wps[i][1]
-                )
+            path_length = sum(math.hypot(new_wps[i+1][0] - new_wps[i][0],
+                                        new_wps[i+1][1] - new_wps[i][1])
+                             for i in range(len(new_wps) - 1))
             
-            # Calculate direct distance to goal
             direct_dist = math.hypot(
                 self.goal_pose[0] - self.current_x,
                 self.goal_pose[1] - self.current_y
             )
             
-            # If A* path is >1.8x longer than direct line, ignore it and explore
             if direct_dist > 5.0 and path_length > direct_dist * 1.8:
                 self.nav_mode = NavigationMode.EXPLORATION
-                self.get_logger().warn(
-                    f"A* path too long ({path_length:.1f}m vs {direct_dist:.1f}m direct) - EXPLORING instead"
-                )
+                self.get_logger().warn(f"Path inefficient - EXPLORING")
                 return
         
-        # Got valid, efficient path - use it
         self.nav_mode = NavigationMode.PATH_FOLLOWING
         
         if self.manual_goal:
@@ -302,21 +297,19 @@ class SmartObstacleNavigator(Node):
         
         if self.waypoints and self.phase == FlightPhase.NAVIGATE:
             old_target = self.waypoints[min(self.wp_index, len(self.waypoints)-1)]
-            dists_to_old_target = [math.hypot(wx - old_target[0], wy - old_target[1]) for wx, wy in new_wps]
-            new_target_idx = int(np.argmin(dists_to_old_target))
+            dists = [math.hypot(wx - old_target[0], wy - old_target[1]) for wx, wy in new_wps]
+            new_idx = int(np.argmin(dists))
             
-            if dists_to_old_target[new_target_idx] < 5.0:
+            if dists[new_idx] < 5.0:
                 self.waypoints = new_wps
-                self.wp_index = new_target_idx
+                self.wp_index = new_idx
             else:
                 self.waypoints = new_wps
-                px, py = self.current_x, self.current_y
-                dists = [math.hypot(wx - px, wy - py) for wx, wy in self.waypoints]
+                dists = [math.hypot(wx - self.current_x, wy - self.current_y) for wx, wy in new_wps]
                 self.wp_index = int(np.argmin(dists))
         else:
             self.waypoints = new_wps
-            px, py = self.current_x, self.current_y
-            dists = [math.hypot(wx - px, wy - py) for wx, wy in self.waypoints]
+            dists = [math.hypot(wx - self.current_x, wy - self.current_y) for wx, wy in new_wps]
             self.wp_index = int(np.argmin(dists))
         
         self.publish_visual_path()
@@ -329,12 +322,9 @@ class SmartObstacleNavigator(Node):
         self.wp_index = 0
         self.manual_goal = True
         self.phase = FlightPhase.NAVIGATE
-        # Start in exploration mode, will switch to path following if A* provides path
         self.nav_mode = NavigationMode.EXPLORATION
         self.publish_visual_path()
-        self.get_logger().info(f"New goal set: ({self.goal_pose[0]:.1f}, {self.goal_pose[1]:.1f})")
-
-    # ---------- SENSOR CALLBACKS ----------
+        self.get_logger().info(f"Goal: ({self.goal_pose[0]:.1f}, {self.goal_pose[1]:.1f})")
 
     def pos_cb(self, msg: VehicleLocalPosition):
         self.current_x = msg.y
@@ -393,8 +383,6 @@ class SmartObstacleNavigator(Node):
             d["f"], d["l"], d["r"], l["f"], l["l"], l["r"]
         )
 
-    # ---------- CONTROL LOOP ----------
-
     def control_loop(self):
         if not self.have_local_position:
             return
@@ -408,37 +396,31 @@ class SmartObstacleNavigator(Node):
             self.current_forward_vel = 0.0
             self.current_side_vel = 0.0
 
-        # INIT
         if self.phase == FlightPhase.INIT:
             self.pub_setpoint(self.current_x, self.current_y, self.current_z, float('nan'))
             if self.offboard_counter == 20:
                 self.pub_command(VehicleCommand.VEHICLE_CMD_DO_SET_MODE, p1=1.0, p2=6.0)
-                self.get_logger().info("Setting OFFBOARD mode")
+                self.get_logger().info("OFFBOARD mode")
             if self.offboard_counter == 25:
                 self.pub_command(VehicleCommand.VEHICLE_CMD_DO_SET_HOME, p1=1.0)
-                self.get_logger().info("Setting home position")
             if self.offboard_counter == 50:
                 self.pub_command(VehicleCommand.VEHICLE_CMD_COMPONENT_ARM_DISARM, p1=1.0)
-                self.get_logger().info("Sending ARM command")
             if self.armed and self.offboard_counter > 60:
                 self.phase = FlightPhase.TAKEOFF
-                self.get_logger().info("ARMED - Starting takeoff")
+                self.get_logger().info("ARMED - Takeoff")
             self.offboard_counter += 1
             return
 
-        # TAKEOFF
         if self.phase == FlightPhase.TAKEOFF:
             self.pub_setpoint(self.current_x, self.current_y, self.flight_altitude, float('nan'))
             if abs(self.current_z - self.flight_altitude) < 0.3:
                 self.phase = FlightPhase.NAVIGATE
                 self.prev_yaw = self.current_yaw
                 self.last_waypoint_time = self.get_clock().now().nanoseconds / 1e9
-                self.get_logger().info(f"Takeoff Complete. Syncing yaw to {self.current_yaw:.2f}")
             return
 
-        # NAVIGATION - Dual Mode Logic
+        # NAVIGATION
         if self.nav_mode == NavigationMode.EXPLORATION:
-            # EXPLORATION MODE: Direct navigation to goal with obstacle avoidance
             if not self.goal_pose:
                 self.pub_setpoint(self.current_x, self.current_y, self.flight_altitude, self.prev_yaw)
                 return
@@ -450,201 +432,266 @@ class SmartObstacleNavigator(Node):
             
             if dist < 1.0:
                 self.phase = FlightPhase.REACHED
-                self.get_logger().info("✓ Goal reached in EXPLORATION mode!")
+                self.get_logger().info("✓ Goal reached!")
                 self.pub_setpoint(self.current_x, self.current_y, self.flight_altitude, self.prev_yaw)
                 return
             
-            # Direct vector to goal
-            if dist > 0.1:
-                dir_x = dx / dist
-                dir_y = dy / dist
-            else:
-                dir_x = dir_y = 0.0
-            
-            dx_look = dx
-            dy_look = dy
-            dist_look = dist
+            dir_x = dx / dist if dist > 0.1 else 0.0
+            dir_y = dy / dist if dist > 0.1 else 0.0
+            dx_look, dy_look = dx, dy
             
             if self.offboard_counter % 20 == 0:
-                self.get_logger().info(f"EXPLORE→({tx:.1f},{ty:.1f}) dist:{dist:.1f}m", throttle_duration_sec=2.0)
+                self.get_logger().info(f"EXPLORE dist:{dist:.1f}m")
         
-        else:  # PATH_FOLLOWING MODE
+        else:  # PATH_FOLLOWING
             if self.wp_index >= len(self.waypoints):
-                # Check if we should switch to exploration
                 if self.goal_pose:
-                    goal_dist = math.hypot(
-                        self.goal_pose[0] - self.current_x,
-                        self.goal_pose[1] - self.current_y
-                    )
+                    goal_dist = math.hypot(self.goal_pose[0] - self.current_x,
+                                          self.goal_pose[1] - self.current_y)
                     if goal_dist > 1.0:
                         self.nav_mode = NavigationMode.EXPLORATION
-                        self.get_logger().warn("Path exhausted - switching to EXPLORATION")
+                        self.get_logger().warn("→ EXPLORATION")
                         return
                 
                 self.pub_setpoint(self.current_x, self.current_y, self.flight_altitude, self.prev_yaw)
                 return
 
-            # Current waypoint target
             tx, ty = self.waypoints[self.wp_index]
             dx = tx - self.current_x
             dy = ty - self.current_y
             dist = math.hypot(dx, dy)
 
-            lookahead = self.get_lookahead_target(lookahead_dist=2.5)
+            lookahead = self.get_lookahead_target()
             if lookahead and dist > 1.5:
-                lx, ly = lookahead
-                dx_look = lx - self.current_x
-                dy_look = ly - self.current_y
+                dx_look = lookahead[0] - self.current_x
+                dy_look = lookahead[1] - self.current_y
             else:
-                dx_look = dx
-                dy_look = dy
+                dx_look, dy_look = dx, dy
 
             dist_look = math.hypot(dx_look, dy_look)
-            if dist_look > 0.1:
-                dir_x = dx_look / dist_look
-                dir_y = dy_look / dist_look
-            else:
-                dir_x = dir_y = 0.0
+            dir_x = dx_look / dist_look if dist_look > 0.1 else 0.0
+            dir_y = dy_look / dist_look if dist_look > 0.1 else 0.0
 
-        # COMMON: Yaw and Speed Control (same for both modes)
+        # YAW
         yaw_target = math.atan2(dx_look, dy_look)
-        yaw_alpha = 0.2
-        self.prev_yaw = (1 - yaw_alpha) * self.prev_yaw + yaw_alpha * yaw_target
+        self.prev_yaw = 0.8 * self.prev_yaw + 0.2 * yaw_target
         yaw_goal = self.prev_yaw
+        self.yaw_history.append(self.prev_yaw)
 
-        # Dynamic speed with corridor boost
-        min_clearance = min(self.fused_left, self.fused_right)
-        is_corridor = (self.fused_left < 2.5 and self.fused_right < 2.5)
+        # SPEED - Optimized for x500 drone dimensions
+        MIN_SAFE_CLEARANCE = self.MIN_SAFE_CLEARANCE
+        CORRIDOR_THRESHOLD = self.CORRIDOR_THRESHOLD
         
-        # In corridors: be more aggressive forward, less scared of sides
-        if is_corridor:
-            if self.fused_front > 2.5:
-                base_speed = 8.0  # Push through corridors
-            elif self.fused_front > 1.5:
-                base_speed = 6.0
+        is_corridor = (self.fused_left < CORRIDOR_THRESHOLD and self.fused_right < CORRIDOR_THRESHOLD)
+        is_wide_open = (self.fused_left > 5.0 and self.fused_right > 5.0)
+        
+        speed_mult = 0.85 if self.nav_mode == NavigationMode.EXPLORATION else 1.0
+        
+        if is_wide_open:
+            # Wide open space - faster, more direct
+            if self.fused_front > 5.0: base_speed = 10.0 * speed_mult
+            elif self.fused_front > 3.0: base_speed = 8.0 * speed_mult
+            else: base_speed = 6.0 * speed_mult
+        elif is_corridor:
+            # Corridor navigation - check if passage is wide enough
+            min_side_clearance = min(self.fused_left, self.fused_right)
+            
+            if min_side_clearance < MIN_SAFE_CLEARANCE:
+                # Too narrow - very slow and careful
+                base_speed = 2.0 * speed_mult
+            elif min_side_clearance < 1.0:
+                # Tight but passable
+                if self.fused_front > 3.0: base_speed = 6.0 * speed_mult
+                elif self.fused_front > 2.0: base_speed = 4.5 * speed_mult
+                else: base_speed = 3.0 * speed_mult
             else:
-                base_speed = 4.0
+                # Good corridor clearance
+                if self.fused_front > 3.0: base_speed = 9.0 * speed_mult
+                elif self.fused_front > 2.0: base_speed = 7.5 * speed_mult
+                else: base_speed = 5.5 * speed_mult
         else:
-            # Open space: original logic
-            if min_clearance < 1.5:
-                base_speed = 5.5
-            elif min_clearance < 3.0:
-                base_speed = 7.5
-            else:
-                base_speed = 9.5
+            # Mixed clearance - one side more open
+            min_clear = min(self.fused_left, self.fused_right)
+            if min_clear < MIN_SAFE_CLEARANCE: 
+                base_speed = 3.5 * speed_mult  # Too close to wall
+            elif min_clear < 1.2: 
+                base_speed = 7.0 * speed_mult
+            else: 
+                base_speed = 9.5 * speed_mult
 
-        heading_error = abs(math.atan2(dy_look, dx_look))
-        if heading_error < math.radians(15): speed_factor = 1.0
-        elif heading_error < math.radians(45): speed_factor = 0.8
-        else: speed_factor = 0.5
-        base_speed *= speed_factor
+        heading_err = abs(math.atan2(dy_look, dx_look))
+        if heading_err < math.radians(15): base_speed *= 1.0
+        elif heading_err < math.radians(45): base_speed *= 0.8
+        else: base_speed *= 0.5
 
-        stopping_dist = 0.4 * self.current_forward_vel + 0.5
+        stopping_dist = 0.4 * self.current_forward_vel + 0.4
+        if self.fused_front < stopping_dist + 1.2:
+            factor = (self.fused_front - 1.0) / (stopping_dist + 0.5)
+            base_speed *= max(0.0, min(1.0, factor))
         
-        if self.fused_front < stopping_dist + 1.5:
-            obstacle_factor = (self.fused_front - 1.2) / (stopping_dist + 0.5)
-            obstacle_factor = max(0.0, min(1.0, obstacle_factor))
-            base_speed *= obstacle_factor
-        
-        if self.fused_front < 1.2: base_speed *= 0.2
-        if self.fused_front < 0.8: base_speed = 0.0
+        # Safety margins based on drone size
+        if self.fused_front < 1.0: base_speed *= 0.3
+        if self.fused_front < 0.7: base_speed = 0.0
 
-        # Acceleration
         max_accel = 3.5
-        max_vel_change = max_accel * dt
         vel_diff = base_speed - self.current_forward_vel
-        if abs(vel_diff) > max_vel_change:
-            vel_diff = max_vel_change if vel_diff > 0 else -max_vel_change
+        vel_diff = max(min(vel_diff, max_accel * dt), -max_accel * dt)
         self.current_forward_vel += vel_diff
         forward_speed = self.current_forward_vel
 
-        # Lateral avoidance with corridor detection
-        safe_zone = 1.8 
+        # LATERAL - Account for drone width
         repulsion = 0.0
         
-        # CORRIDOR DETECTION: If both sides tight, center yourself gently
-        is_corridor = (self.fused_left < 2.5 and self.fused_right < 2.5)
-        
         if is_corridor:
-            # In corridor: gentle centering only
             balance = self.fused_left - self.fused_right
-            repulsion = balance * 0.8  # Gentle centering gain
-            # Clamp to prevent oscillation
-            repulsion = max(min(repulsion, 1.5), -1.5)
-        else:
-            # Open space: normal repulsion
-            if self.fused_left < safe_zone:
-                push = (safe_zone - self.fused_left) * 1.5
-                repulsion -= push
+            
+            # If either side too close, stronger repulsion
+            if self.fused_left < MIN_SAFE_CLEARANCE or self.fused_right < MIN_SAFE_CLEARANCE:
+                repulsion = max(min(balance * 1.2, 2.5), -2.5)
+            else:
+                repulsion = max(min(balance * 0.8, 1.5), -1.5)
+        elif is_wide_open:
+            # In wide open spaces: strongly bias toward goal direction
+            if self.goal_pose:
+                dx_g = self.goal_pose[0] - self.current_x
+                dy_g = self.goal_pose[1] - self.current_y
+                goal_angle = math.atan2(dy_g, dx_g)
+                heading_diff = goal_angle - self.current_yaw
+                # Normalize to [-pi, pi]
+                while heading_diff > math.pi:
+                    heading_diff -= 2 * math.pi
+                while heading_diff < -math.pi:
+                    heading_diff += 2 * math.pi
                 
-            if self.fused_right < safe_zone:
-                push = (safe_zone - self.fused_right) * 1.5
-                repulsion += push
+                # Strong lateral correction toward goal (max 3 m/s)
+                repulsion = 3.0 * math.sin(heading_diff)
+        else:
+            # Open or mixed space - avoid walls based on drone size
+            if self.fused_left < MIN_SAFE_CLEARANCE:
+                repulsion -= (MIN_SAFE_CLEARANCE - self.fused_left) * 2.0
+            if self.fused_right < MIN_SAFE_CLEARANCE:
+                repulsion += (MIN_SAFE_CLEARANCE - self.fused_right) * 2.0
         
-        # Wall slide: ONLY if front is very close AND we have clearance on one side
-        wall_slide_vel = 0.0
-        if self.fused_front < 1.8 and not is_corridor:  # Don't slide in tight corridors
-            slide_gain = 2.0
-            if self.fused_left > self.fused_right + 0.5:  # Clear preference
-                wall_slide_vel = slide_gain * (1.0 - self.fused_front/1.8)
-            elif self.fused_right > self.fused_left + 0.5:
-                wall_slide_vel = -slide_gain * (1.0 - self.fused_front/1.8)
+        wall_slide = 0.0
+        if self.fused_front < 2.5 and not is_wide_open:
+            clear_diff = self.fused_left - self.fused_right
+            slide_int = 1.0 - (self.fused_front / 2.5)
+            
+            if abs(clear_diff) > 0.3:
+                wall_slide = 4.0 * slide_int * (1 if clear_diff > 0 else -1)
+                if self.fused_front < 1.2:
+                    wall_slide *= 1.5
+            else:
+                if self.goal_pose:
+                    dx_g = self.goal_pose[0] - self.current_x
+                    dy_g = self.goal_pose[1] - self.current_y
+                    cross = dx_g * math.cos(self.current_yaw) - dy_g * math.sin(self.current_yaw)
+                    wall_slide = 3.5 * slide_int * (1 if cross > 0 else -1)
 
-        target_side_vel = repulsion + wall_slide_vel
-        target_side_vel = max(min(target_side_vel, 3.5), -3.5)
-
-        alpha_side = 0.25
-        self.current_side_vel = (1 - alpha_side) * self.current_side_vel + alpha_side * target_side_vel
+        target_side = max(min(repulsion + wall_slide, 5.0), -5.0)
+        self.current_side_vel = 0.75 * self.current_side_vel + 0.25 * target_side
         lateral_speed = self.current_side_vel
+        
+        self.lateral_history.append(lateral_speed)
+        if self.is_oscillating():
+            lateral_speed *= 0.5
 
-        # Critical safety
-        if self.fused_front < 0.6:
-            forward_speed = -0.5
-            if self.fused_left > self.fused_right:
-                lateral_speed = 2.0
-            else:
-                lateral_speed = -2.0
-            self.get_logger().warn("CRITICAL: Too Close!")
+        if self.fused_front < 0.7:  # Emergency reverse based on drone safety
+            forward_speed = -0.8
+            lateral_speed = 3.0 if self.fused_left > self.fused_right else -3.0
 
-        # Stuck detection (PATH mode only)
-        if self.nav_mode == NavigationMode.PATH_FOLLOWING:
-            if self.is_stuck() and dist > 1.5:
-                self.stuck_counter += 1
-                if self.stuck_counter > 20:
-                    self.wp_index += 1
-                    self.stuck_counter = 0
-                    self.publish_visual_path()
-                    if self.wp_index >= len(self.waypoints):
+        # PROGRESS CHECK
+        now = self.get_clock().now().nanoseconds / 1e9
+        if now - self.last_progress_check > 5.0:
+            if self.goal_pose:
+                curr_dist = math.hypot(self.goal_pose[0] - self.current_x,
+                                      self.goal_pose[1] - self.current_y)
+                
+                if self.last_progress_distance > 0 and abs(curr_dist - self.last_progress_distance) < 0.5:
+                    self.consecutive_failures += 1
+                    
+                    if self.consecutive_failures >= 3:
+                        if self.nav_mode == NavigationMode.PATH_FOLLOWING:
+                            self.nav_mode = NavigationMode.EXPLORATION
+                            self.get_logger().warn("No progress → EXPLORATION")
+                        else:
+                            if self.wp_index < len(self.waypoints) - 1:
+                                self.wp_index += 1
+                        self.consecutive_failures = 0
+                else:
+                    self.consecutive_failures = 0
+                
+                self.last_progress_distance = curr_dist
+            self.last_progress_check = now
+        
+        # STUCK CHECK - Account for drone size (needs 0.7m clearance minimum)
+        # Only truly trapped if all clearances below safe threshold AND not moving
+        is_trapped = (self.fused_front < MIN_SAFE_CLEARANCE and 
+                     self.fused_left < MIN_SAFE_CLEARANCE and 
+                     self.fused_right < MIN_SAFE_CLEARANCE and 
+                     forward_speed < 0.5)
+        
+        # Also detect "lost in open space" - not making progress in wide areas
+        is_lost_in_open = (is_wide_open and self.consecutive_failures >= 2)
+        
+        if is_lost_in_open and self.goal_pose:
+            # Force aggressive turn toward goal
+            dx_g = self.goal_pose[0] - self.current_x
+            dy_g = self.goal_pose[1] - self.current_y
+            goal_yaw = math.atan2(dy_g, dx_g)
+            
+            # Override yaw to point directly at goal
+            yaw_goal = goal_yaw
+            forward_speed = 3.0  # Moderate speed while reorienting
+            lateral_speed = 0.0
+            
+            self.get_logger().warn("Lost in open space - reorienting to goal", throttle_duration_sec=1.0)
+        
+        if is_trapped:
+            self.stuck_counter += 1  # Slower escalation
+            if self.stuck_counter > 20:  # Give more time before backing up
+                forward_speed = -1.5
+                lateral_speed = 0.0
+                
+                if self.stuck_counter > 40:  # Double the threshold before giving up
+                    if self.nav_mode == NavigationMode.PATH_FOLLOWING:
+                        self.wp_index += 1
+                        self.stuck_counter = 0
+                        self.publish_visual_path()
+                        if self.wp_index >= len(self.waypoints):
+                            if self.goal_pose:
+                                self.nav_mode = NavigationMode.EXPLORATION
+                            else:
+                                self.phase = FlightPhase.REACHED
+                        return
+                    else:
                         self.phase = FlightPhase.REACHED
-                    return
-            else:
-                self.stuck_counter = max(0, self.stuck_counter - 1)
+                        self.get_logger().error("Truly trapped - giving up")
+                        return
+        elif self.is_stuck() and self.nav_mode == NavigationMode.PATH_FOLLOWING:
+            self.stuck_counter += 1
+            if self.stuck_counter > 20:
+                self.wp_index += 1
+                self.stuck_counter = 0
+                self.publish_visual_path()
+                if self.wp_index >= len(self.waypoints):
+                    self.phase = FlightPhase.REACHED
+                return
+        else:
+            self.stuck_counter = max(0, self.stuck_counter - 1)
 
-        # Compute global velocity
-        tan_x = -dir_y
-        tan_y = dir_x
+        # COMPUTE POSITION
+        tan_x, tan_y = -dir_y, dir_x
         nx = self.current_x + (dir_x * forward_speed + tan_x * lateral_speed) * dt
         ny = self.current_y + (dir_y * forward_speed + tan_y * lateral_speed) * dt
         nz = self.flight_altitude
 
-        # Waypoint progression (PATH mode only)
+        # WAYPOINT PROGRESSION
         if self.nav_mode == NavigationMode.PATH_FOLLOWING and dist < 1.0:
-            now = self.get_clock().now().nanoseconds / 1e9
-            elapsed = now - self.last_waypoint_time
-            self.last_waypoint_time = now
             self.wp_index += 1
             self.publish_visual_path()
             if self.wp_index >= len(self.waypoints):
                 self.phase = FlightPhase.REACHED
-                self.get_logger().info("✓ All waypoints reached!")
-            else:
-                self.get_logger().info(f"✓ WP {self.wp_index-1} ({elapsed:.1f}s) → WP {self.wp_index}")
-
-        if self.offboard_counter % 20 == 0:
-            mode_str = "PATH" if self.nav_mode == NavigationMode.PATH_FOLLOWING else "EXPLORE"
-            self.get_logger().info(
-                f"[{mode_str}] S:{forward_speed:.1f} Side:{lateral_speed:.1f} F:{self.fused_front:.1f} L:{self.fused_left:.1f} R:{self.fused_right:.1f}"
-            )
 
         self.pub_setpoint(nx, ny, nz, yaw_goal)
         self.offboard_counter += 1
@@ -679,6 +726,7 @@ class SmartObstacleNavigator(Node):
         msg.timestamp = int(self.get_clock().now().nanoseconds / 1000)
         self.command_pub.publish(msg)
 
+
 def main(args=None):
     rclpy.init(args=args)
     node = SmartObstacleNavigator()
@@ -689,6 +737,7 @@ def main(args=None):
     finally:
         node.destroy_node()
         rclpy.shutdown()
+
 
 if __name__ == "__main__":
     main()
