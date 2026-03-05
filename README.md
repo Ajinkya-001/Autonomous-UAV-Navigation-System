@@ -247,9 +247,11 @@ You are free to use, modify and distribute this software for research and develo
 
 B.Tech – Artificial Intelligence & Robotics  
 
-Email: ajinkyapatilckl@gmail.com  
+Email: ajinkyapatilckl@gmail.com
 
-GitHub: https://github.com/Ajinkya-001
+GitHub: [Ajinkya-001](https://github.com/Ajinkya-001)  
+
+LinkedIn: [Ajinkya Patil](https://www.linkedin.com/in/ajinkya-patil-728a19313/)
 
 
 
